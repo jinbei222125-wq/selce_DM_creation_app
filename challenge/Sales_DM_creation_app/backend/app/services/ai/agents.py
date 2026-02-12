@@ -1,9 +1,18 @@
 """
 LangGraph-based AI Agents for DM Generation Pipeline
+
+改善版: 
+- 言語・地域対応（日本企業なら日本語、海外企業なら英語）
+- 商材情報を検索クエリに組み込み
+- 複数観点での検索
+- 検索結果のスコアリング
+- 不適切コンテンツのフィルタリング
 """
 from __future__ import annotations
-from typing import List, TypedDict, Callable, Optional
+from typing import List, TypedDict, Callable, Optional, Tuple
 import asyncio
+import re
+from urllib.parse import urlparse
 from datetime import datetime
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -22,6 +31,110 @@ from app.schemas.dm import (
 from app.core.security import ExternalServiceError
 
 
+# ---- 不適切コンテンツフィルタリング ----
+BLOCKED_DOMAINS = [
+    "pornhub", "xvideos", "xhamster", "redtube", "youporn",
+    "xnxx", "tube8", "spankbang", "beeg", "porn",
+    "adult", "xxx", "sex", "hentai", "erotic",
+]
+
+BLOCKED_KEYWORDS = [
+    "porn", "xxx", "adult video", "erotic", "hentai",
+    "アダルト", "ポルノ", "エロ", "風俗", "デリヘル",
+    "出会い系", "セフレ", "不倫",
+]
+
+
+def _is_inappropriate_content(text: str, url: str) -> bool:
+    """不適切なコンテンツかどうかをチェック"""
+    text_lower = text.lower()
+    url_lower = url.lower()
+    
+    # ドメインチェック
+    for blocked in BLOCKED_DOMAINS:
+        if blocked in url_lower:
+            return True
+    
+    # キーワードチェック
+    for keyword in BLOCKED_KEYWORDS:
+        if keyword.lower() in text_lower or keyword in text:
+            return True
+    
+    return False
+
+
+# ---- 言語・地域判定 ----
+JAPANESE_TLDS = [".jp", ".co.jp", ".or.jp", ".ne.jp", ".ac.jp", ".go.jp"]
+JAPANESE_DOMAINS = ["rakuten", "yahoo.co.jp", "nikkei", "recruit", "cyberagent", "mercari", "line"]
+
+def _detect_region(url: str, company_name: str | None) -> Tuple[str, str]:
+    """
+    URLと会社名から地域と言語を判定
+    
+    Returns:
+        (region, language): ("japan", "ja") or ("global", "en")
+    """
+    url_lower = url.lower()
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
+    
+    # 日本のTLDチェック
+    for tld in JAPANESE_TLDS:
+        if domain.endswith(tld):
+            return ("japan", "ja")
+    
+    # 日本の有名企業ドメインチェック
+    for jp_domain in JAPANESE_DOMAINS:
+        if jp_domain in domain:
+            return ("japan", "ja")
+    
+    # 会社名に日本語が含まれているかチェック
+    if company_name:
+        # 日本語文字（ひらがな、カタカナ、漢字）が含まれているか
+        if re.search(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', company_name):
+            return ("japan", "ja")
+    
+    # デフォルトはグローバル（英語）
+    return ("global", "en")
+
+
+# ---- 商材からキーワード抽出 ----
+def _extract_product_keywords(product_name: str, product_summary: str) -> List[str]:
+    """商材情報からキーワードを抽出"""
+    # 簡易的なキーワード抽出（将来的にはNLPを使用）
+    keywords = []
+    
+    # 商材名を追加
+    keywords.append(product_name)
+    
+    # よくあるB2B SaaSカテゴリとキーワードマッピング
+    category_keywords = {
+        # 日本語キーワード
+        "チャットボット": ["カスタマーサポート", "顧客対応", "自動応答", "問い合わせ対応"],
+        "CRM": ["顧客管理", "営業支援", "セールス", "商談管理"],
+        "MA": ["マーケティング", "リード獲得", "メール配信", "ナーチャリング"],
+        "HR": ["人事", "採用", "労務管理", "勤怠管理", "人材"],
+        "会計": ["経理", "請求書", "経費精算", "財務"],
+        "セキュリティ": ["情報漏洩", "サイバー攻撃", "認証", "アクセス管理"],
+        "AI": ["業務効率化", "自動化", "DX", "デジタル変革"],
+        "クラウド": ["インフラ", "サーバー", "データ管理"],
+        # 英語キーワード
+        "chatbot": ["customer support", "customer service", "automation"],
+        "crm": ["sales", "customer relationship", "pipeline"],
+        "marketing": ["lead generation", "email", "campaign"],
+        "security": ["cybersecurity", "data protection", "compliance"],
+    }
+    
+    # 商材名と要約から関連カテゴリを検出
+    combined_text = f"{product_name} {product_summary}".lower()
+    for category, related_keywords in category_keywords.items():
+        if category.lower() in combined_text:
+            keywords.extend(related_keywords)
+    
+    # 重複を削除
+    return list(set(keywords))
+
+
 # ---- LangGraph State ----
 class DMState(TypedDict):
     target_url: str
@@ -30,6 +143,11 @@ class DMState(TypedDict):
     your_product_name: str
     your_product_summary: str
     preferred_tones: List[ToneType] | None
+    
+    # 追加: 検索用メタデータ
+    region: str  # "japan" or "global"
+    language: str  # "ja" or "en"
+    product_keywords: List[str]
     
     evidences: List[EvidenceItem]
     hooks: List[HookItem]
@@ -40,7 +158,7 @@ class DMState(TypedDict):
 
 
 # ---- Initialize Tools & LLM ----
-def _get_tavily_tool():
+def _get_tavily_tool(max_results: int = 5):
     """Tavily検索ツールを初期化"""
     if not settings.tavily_api_key:
         raise ExternalServiceError("Tavily API key is not configured")
@@ -50,8 +168,8 @@ def _get_tavily_tool():
     os.environ["TAVILY_API_KEY"] = settings.tavily_api_key
     
     return TavilySearchResults(
-        tavily_api_key=settings.tavily_api_key,  # パラメータ名を確認
-        max_results=settings.tavily_max_results,
+        tavily_api_key=settings.tavily_api_key,
+        max_results=max_results,
         search_depth=settings.tavily_search_depth,
         include_answer=True,
     )
@@ -69,47 +187,188 @@ def _get_llm():
     )
 
 
+# ---- 検索結果のスコアリング ----
+def _score_evidence(evidence_text: str, product_keywords: List[str], language: str) -> int:
+    """検索結果と商材との関連度をスコアリング"""
+    score = 0
+    text_lower = evidence_text.lower()
+    
+    # 商材キーワードとのマッチ
+    for keyword in product_keywords:
+        if keyword.lower() in text_lower:
+            score += 10
+    
+    # ビジネス関連キーワード（高スコア）
+    business_keywords_ja = ["導入", "課題", "検討", "効率化", "改善", "強化", "投資", "DX", "成長"]
+    business_keywords_en = ["implement", "challenge", "improve", "efficiency", "growth", "invest", "digital"]
+    
+    keywords = business_keywords_ja if language == "ja" else business_keywords_en
+    for keyword in keywords:
+        if keyword.lower() in text_lower:
+            score += 5
+    
+    # ニュース・プレスリリース関連（中スコア）
+    news_keywords = ["発表", "リリース", "調達", "提携", "launch", "announce", "funding", "partnership"]
+    for keyword in news_keywords:
+        if keyword.lower() in text_lower:
+            score += 3
+    
+    return score
+
+
 # ---- Agent Nodes ----
 def researcher_node(state: DMState) -> DMState:
     """
     Researcher Agent: Tavilyを使って企業の最新情報を収集
+    
+    改善点:
+    - 言語・地域に応じた検索クエリ
+    - 商材に関連する情報を優先的に検索
+    - 複数観点での検索（基本情報、商材関連、採用情報）
+    - 検索結果のスコアリングとフィルタリング
     """
     callback = state.get("progress_callback")
     if callback:
         callback(ProgressUpdate(
             stage="researching",
-            message="企業の最新動向を調査中...",
-            progress=20
+            message="企業情報を多角的に調査中...",
+            progress=10
         ))
     
-    tavily = _get_tavily_tool()
+    tavily = _get_tavily_tool(max_results=5)
     
-    # 検索クエリを構築
-    query_parts = [
-        f"Website: {state['target_url']}",
-        "Find the company's latest news, product updates, funding rounds, challenges, and vision from the last 3 months.",
-    ]
-    if state.get("company_name"):
-        query_parts.append(f"Company name: {state['company_name']}")
-    if state.get("target_role"):
-        query_parts.append(f"Target role: {state['target_role']}")
+    # 地域・言語を取得
+    region = state.get("region", "japan")
+    language = state.get("language", "ja")
+    product_keywords = state.get("product_keywords", [])
+    company_name = state.get("company_name") or ""
+    target_url = state["target_url"]
+    product_name = state["your_product_name"]
     
-    query = " ".join(query_parts)
+    # ---- 複数観点での検索クエリを構築 ----
+    queries = []
     
-    try:
-        raw_results = tavily.invoke({"query": query})
-    except Exception as e:
-        raise ExternalServiceError(f"Tavily search failed: {str(e)}")
+    if language == "ja":
+        # 日本語検索クエリ
+        
+        # 1. 基本情報・最新ニュース
+        queries.append(
+            f"{company_name} 最新ニュース プレスリリース 2024 2025"
+            if company_name else f"site:{target_url} 最新ニュース"
+        )
+        
+        # 2. 商材関連の課題・取り組み
+        if product_keywords:
+            keyword_str = " OR ".join(product_keywords[:3])
+            queries.append(
+                f"{company_name} {keyword_str} 課題 導入 検討"
+                if company_name else f"site:{target_url} {keyword_str}"
+            )
+        
+        # 3. 採用情報（どの部門を強化中か）
+        queries.append(
+            f"{company_name} 採用 求人 募集 強化"
+            if company_name else f"site:{target_url} 採用"
+        )
+        
+    else:
+        # 英語検索クエリ
+        
+        # 1. 基本情報・最新ニュース
+        queries.append(
+            f"{company_name} latest news press release 2024 2025"
+            if company_name else f"site:{target_url} latest news"
+        )
+        
+        # 2. 商材関連の課題・取り組み
+        if product_keywords:
+            keyword_str = " OR ".join(product_keywords[:3])
+            queries.append(
+                f"{company_name} {keyword_str} challenges implementation"
+                if company_name else f"site:{target_url} {keyword_str}"
+            )
+        
+        # 3. 採用情報
+        queries.append(
+            f"{company_name} careers hiring jobs"
+            if company_name else f"site:{target_url} careers"
+        )
     
-    # EvidenceItemにマッピング
+    # ---- 検索実行 ----
+    all_results = []
+    total_queries = len(queries)
+    
+    for idx, query in enumerate(queries):
+        if callback:
+            progress = 10 + int((idx + 1) / total_queries * 20)
+            search_type = ["基本情報", "商材関連", "採用情報"][idx] if language == "ja" else ["Basic Info", "Product Related", "Hiring"][idx]
+            callback(ProgressUpdate(
+                stage="researching",
+                message=f"{search_type}を検索中... ({idx + 1}/{total_queries})",
+                progress=progress
+            ))
+        
+        try:
+            raw_results = tavily.invoke({"query": query})
+            if raw_results:
+                all_results.extend(raw_results)
+        except Exception as e:
+            # 個別の検索失敗は無視して続行
+            print(f"Search query failed: {query}, error: {e}")
+            continue
+    
+    if not all_results:
+        raise ExternalServiceError("All search queries failed. Please try again.")
+    
+    # ---- 重複排除 ----
+    seen_urls = set()
+    unique_results = []
+    for item in all_results:
+        url = item.get("url", "")
+        if url not in seen_urls:
+            seen_urls.add(url)
+            unique_results.append(item)
+    
+    # ---- フィルタリング（不適切コンテンツ除外） ----
+    filtered_results = []
+    for item in unique_results:
+        title = item.get("title", "")
+        content = item.get("content", "")
+        url = item.get("url", "")
+        
+        if not _is_inappropriate_content(f"{title} {content}", url):
+            filtered_results.append(item)
+    
+    if callback:
+        callback(ProgressUpdate(
+            stage="researching",
+            message=f"検索結果をスコアリング中...",
+            progress=35
+        ))
+    
+    # ---- スコアリング ----
+    scored_results = []
+    for item in filtered_results:
+        title = item.get("title", "")
+        content = item.get("content", "")
+        score = _score_evidence(f"{title} {content}", product_keywords, language)
+        scored_results.append((score, item))
+    
+    # スコア順にソート（高い順）
+    scored_results.sort(key=lambda x: x[0], reverse=True)
+    
+    # 上位8件を採用
+    top_results = [item for score, item in scored_results[:8]]
+    
+    # ---- EvidenceItemにマッピング ----
     evidences: List[EvidenceItem] = []
-    for i, item in enumerate(raw_results or []):
+    for i, item in enumerate(top_results):
         evidences.append(
             EvidenceItem(
                 source=item.get("source", "web"),
                 title=item.get("title", f"Result {i+1}"),
-                snippet=item.get("content", "")[:500],  # 500文字に制限
-                url=item.get("url", str(state["target_url"])),
+                snippet=item.get("content", "")[:500],
+                url=item.get("url", str(target_url)),
             )
         )
     
@@ -118,7 +377,7 @@ def researcher_node(state: DMState) -> DMState:
     if callback:
         callback(ProgressUpdate(
             stage="researching",
-            message=f"{len(evidences)}件の情報を収集しました",
+            message=f"{len(evidences)}件の関連情報を収集しました",
             progress=40
         ))
     
@@ -370,8 +629,27 @@ async def generate_dm_async(
 ) -> dict:
     """
     DM生成を非同期で実行
+    
+    改善点:
+    - URLと会社名から言語・地域を自動判定
+    - 商材情報からキーワードを自動抽出
     """
     graph = build_dm_graph()
+    
+    # 言語・地域を判定
+    region, language = _detect_region(str(target_url), company_name)
+    
+    # 商材からキーワードを抽出
+    product_keywords = _extract_product_keywords(your_product_name, your_product_summary)
+    
+    # 進捗コールバックで判定結果を通知
+    if progress_callback:
+        region_label = "日本企業" if region == "japan" else "グローバル企業"
+        progress_callback(ProgressUpdate(
+            stage="researching",
+            message=f"{region_label}として検索を開始します...",
+            progress=5
+        ))
     
     initial_state: DMState = {
         "target_url": str(target_url),
@@ -380,6 +658,11 @@ async def generate_dm_async(
         "your_product_name": your_product_name,
         "your_product_summary": your_product_summary,
         "preferred_tones": preferred_tones or ["polite", "casual", "problem_solver"],
+        # 追加: 検索用メタデータ
+        "region": region,
+        "language": language,
+        "product_keywords": product_keywords,
+        # 結果格納用
         "evidences": [],
         "hooks": [],
         "drafts": [],
