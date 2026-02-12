@@ -13,6 +13,34 @@ const apiClient = axios.create({
   },
 });
 
+// Helper function to format validation errors
+function formatValidationErrors(detail: unknown): string {
+  // FastAPI 422 errors return an array of validation errors
+  if (Array.isArray(detail)) {
+    return detail
+      .map((err: { loc?: string[]; msg?: string }) => {
+        const field = err.loc?.slice(-1)[0] || "unknown";
+        const fieldNames: Record<string, string> = {
+          target_url: "URL",
+          your_product_name: "商材名",
+          your_product_summary: "商材の要約",
+        };
+        const fieldName = fieldNames[field] || field;
+        return `${fieldName}: ${err.msg || "入力エラー"}`;
+      })
+      .join("\n");
+  }
+  // If it's an object, try to get a message
+  if (typeof detail === "object" && detail !== null) {
+    return JSON.stringify(detail);
+  }
+  // If it's a string, return as-is
+  if (typeof detail === "string") {
+    return detail;
+  }
+  return "";
+}
+
 // Error handling interceptor
 apiClient.interceptors.response.use(
   (response) => response,
@@ -21,10 +49,28 @@ apiClient.interceptors.response.use(
     
     if (error.response) {
       // Server responded with error
-      const detail = error.response.data?.detail || error.response.data?.message || `API Error: ${error.response.status}`;
-      throw new Error(detail);
+      const status = error.response.status;
+      const detail = error.response.data?.detail || error.response.data?.message || "";
+      const formattedError = formatValidationErrors(detail);
+      
+      // 422 Validation Error
+      if (status === 422) {
+        throw new Error(`入力内容を確認してください:\n${formattedError}`);
+      }
+      
+      // OpenAI API quota exceeded error
+      if (typeof formattedError === "string" && (formattedError.includes("quota") || formattedError.includes("429"))) {
+        throw new Error(
+          "OpenAI APIのクォータが超過しています。\n" +
+          "OpenAIダッシュボード（https://platform.openai.com/account/billing）で\n" +
+          "クレジットを追加するか、新しいAPIキーを設定してください。"
+        );
+      }
+      
+      // Other API errors
+      throw new Error(formattedError || `APIエラー: ${status}`);
     } else if (error.request) {
-      // Request made but no response
+      // Request made but no response (including CORS errors)
       console.error("No response received:", error.request);
       throw new Error(
         `ネットワークエラー: サーバーに接続できませんでした。\n` +

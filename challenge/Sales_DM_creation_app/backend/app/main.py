@@ -28,11 +28,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware
+# CORS middleware - 開発環境ではすべてのオリジンを許可
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=True,
+    allow_origins=["*"],  # 本番環境では settings.cors_origins に変更
+    allow_credentials=False,  # allow_origins=["*"] の場合は False にする必要がある
     allow_methods=["*"],
     allow_headers=["*"],
 )

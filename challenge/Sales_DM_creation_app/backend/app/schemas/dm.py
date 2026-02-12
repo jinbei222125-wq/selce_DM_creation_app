@@ -32,7 +32,7 @@ class GenerateDMRequest(BaseModel):
     target_role: Optional[str] = Field(None, description="ターゲットの役職")
     company_name: Optional[str] = Field(None, description="会社名")
     your_product_name: str = Field(..., min_length=1, description="あなたの商材名")
-    your_product_summary: str = Field(..., min_length=10, description="商材の要約（10文字以上）")
+    your_product_summary: str = Field(..., min_length=1, description="商材の要約")
     preferred_tones: Optional[List[ToneType]] = Field(
         default=["polite", "casual", "problem_solver"],
         description="生成するトーンのリスト"
